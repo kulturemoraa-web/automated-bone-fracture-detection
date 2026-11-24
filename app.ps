@@ -1,0 +1,108 @@
+import io
+import tempfile
+from datetime import datetime
+import cv2
+import numpy as np
+import pydicom
+import streamlit as st
+from fpdf import FPDF
+from PIL import Image
+from ultralytics import YOLO
+
+st.set_page_config(page_title="AI Fracture Triage & Reporting", layout="wide")
+st.title("Automated Bone Fracture Detection & Reporting Assistant")
+st.caption("Clinical Decision-Support Prototype | Supports PNG, JPG, and DICOM (.dcm)")
+
+@st.cache_resource
+def load_model(weights_path="best.pt"):
+    return YOLO(weights_path)
+
+def apply_clahe(bgr_image):
+    lab = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    enhanced = cv2.merge((cl, a, b))
+    return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+def read_xray_file(uploaded_file):
+    metadata = {"PatientID": "N/A", "Modality": "DX/CR", "StudyDate": datetime.now().strftime("%Y-%m-%d")}
+    file_bytes = uploaded_file.read()
+
+    if uploaded_file.name.lower().endswith(".dcm"):
+        ds = pydicom.dcmread(io.BytesIO(file_bytes))
+        metadata["PatientID"] = str(getattr(ds, "PatientID", "Anonymous"))
+        metadata["Modality"] = str(getattr(ds, "Modality", "DX"))
+        metadata["StudyDate"] = str(getattr(ds, "StudyDate", metadata["StudyDate"]))
+
+        pixel_array = ds.pixel_array.astype(float)
+        scaled = (np.maximum(pixel_array, 0) / pixel_array.max()) * 255.0
+        uint8_img = np.uint8(scaled)
+        bgr_img = cv2.cvtColor(uint8_img, cv2.COLOR_GRAY2BGR)
+    else:
+        pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        bgr_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    return apply_clahe(bgr_img), metadata
+
+def generate_pdf_report(metadata, findings_text, clinician_notes, orig_bgr, annotated_bgr):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 15)
+    pdf.cell(0, 10, "PRELIMINARY AI RADIOLOGY TRIAGE REPORT", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Status: Pending Radiologist Sign-Off", ln=True, align="C")
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, f"Patient / Study ID: {metadata['PatientID']}   |   Modality: {metadata['Modality']}   |   Study Date: {metadata['StudyDate']}", ln=True)
+    pdf.ln(4)
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_orig, tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_ann:
+        cv2.imwrite(tmp_orig.name, orig_bgr)
+        cv2.imwrite(tmp_ann.name, annotated_bgr)
+        pdf.image(tmp_orig.name, x=15, y=48, w=85)
+        pdf.image(tmp_ann.name, x=110, y=48, w=85)
+
+    pdf.ln(95)
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "Automated AI Detection Summary:", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(0, 6, findings_text)
+    pdf.ln(4)
+
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 7, "Clinician / Radiographer Verification Notes:", ln=True)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(0, 6, clinician_notes if clinician_notes.strip() else "No additional notes entered.")
+
+    return bytes(pdf.output())
+
+uploaded = st.file_uploader("Upload Musculoskeletal X-Ray (.dcm, .png, .jpg)", type=["dcm", "png", "jpg", "jpeg"])
+
+if uploaded:
+    bgr_img, meta = read_xray_file(uploaded)
+    model = load_model("best.pt")
+    results = model.predict(bgr_img, conf=0.35)
+    annotated_bgr = results[0].plot()
+
+    boxes = results[0].boxes
+    if len(boxes) > 0:
+        confs = [f"{float(c)*100:.1f}%" for c in boxes.conf]
+        summary = f"ALERT: {len(boxes)} suspected fracture region(s) localized (Confidence: {', '.join(confs)}). Priority specialist review recommended."
+    else:
+        summary = "No high-confidence fracture localized by AI model. Correlate clinically."
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Enhanced Input X-Ray")
+        st.image(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.json(meta)
+    with col2:
+        st.subheader("AI Fracture Localization")
+        st.image(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.info(summary)
+
+    notes = st.text_area("Clinician / Radiographer Notes", placeholder="Enter anatomical site, clinical history, or verification notes...")
+    pdf_bytes = generate_pdf_report(meta, summary, notes, bgr_img, annotated_bgr)
+    st.download_button("Download Preliminary Radiology Report (PDF)", data=pdf_bytes, file_name=f"Radiology_Report_{meta['PatientID']}.pdf", mime="application/pdf")
